@@ -1,11 +1,17 @@
 cmake_minimum_required(VERSION 2.8.12)
+# When using CMake 3.4 and later, don't export symbols from executables unless
+# the CMAKE_ENABLE_EXPORTS variable is set.
+if(POLICY CMP0065)
+  cmake_policy(SET CMP0065 NEW)
+endif()
 
 if(CMAKE_EXECUTABLE_SUFFIX)
   set(CMAKE_EXECUTABLE_SUFFIX_TMP ${CMAKE_EXECUTABLE_SUFFIX})
 endif()
 
 project(mozjpeg C)
-set(VERSION 4.1.0)
+set(VERSION 4.1.3)
+set(COPYRIGHT_YEAR "1991-2023")
 string(REPLACE "." ";" VERSION_TRIPLET ${VERSION})
 list(GET VERSION_TRIPLET 0 VERSION_MAJOR)
 list(GET VERSION_TRIPLET 1 VERSION_MINOR)
@@ -25,6 +31,24 @@ pad_number(VERSION_MINOR 3)
 pad_number(VERSION_REVISION 3)
 set(LIBJPEG_TURBO_VERSION_NUMBER ${VERSION_MAJOR}${VERSION_MINOR}${VERSION_REVISION})
 
+# CMake 3.14 and later sets CMAKE_MACOSX_BUNDLE to TRUE by default when
+# CMAKE_SYSTEM_NAME is iOS, tvOS, or watchOS, which breaks the libjpeg-turbo
+# build.  (Specifically, when CMAKE_MACOSX_BUNDLE is TRUE, executables for
+# Apple platforms are built as application bundles, which causes CMake to
+# complain that our install() directives for executables do not specify a
+# BUNDLE DESTINATION.  Even if CMake did not complain, building executables as
+# application bundles would break our iOS packages.)
+set(CMAKE_MACOSX_BUNDLE FALSE)
+
+get_property(GENERATOR_IS_MULTI_CONFIG GLOBAL PROPERTY
+  GENERATOR_IS_MULTI_CONFIG)
+# If the GENERATOR_IS_MULTI_CONFIG property doesn't exist (CMake < 3.9), then
+# set the GENERATOR_IS_MULTI_CONFIG variable manually if the generator is
+# Visual Studio or Xcode (the only multi-config generators in CMake < 3.9).
+if(NOT GENERATOR_IS_MULTI_CONFIG AND (MSVC_IDE OR XCODE))
+  set(GENERATOR_IS_MULTI_CONFIG TRUE)
+endif()
+
 string(TIMESTAMP DEFAULT_BUILD "%Y%m%d")
 set(BUILD ${DEFAULT_BUILD} CACHE STRING "Build string (default: ${DEFAULT_BUILD})")
 
@@ -37,6 +61,8 @@ endif()
 message(STATUS "CMAKE_BUILD_TYPE = ${CMAKE_BUILD_TYPE}")
 
 message(STATUS "VERSION = ${VERSION}, BUILD = ${BUILD}")
+
+include(cmakescripts/PackageInfo.cmake)
 
 # Detect CPU type and whether we're building 64-bit or 32-bit code
 math(EXPR BITS "${CMAKE_SIZEOF_VOID_P} * 8")
@@ -272,6 +298,16 @@ if(NOT WITH_JPEG8)
   report_option(WITH_MEM_SRCDST "In-memory source/destination managers")
 endif()
 
+# 0: Original libjpeg v6b/v7/v8 API/ABI
+#
+# libjpeg v6b/v7 API/ABI emulation:
+# 1: + In-memory source/destination managers (libjpeg-turbo 1.3.x)
+# 2: + Partial image decompression functions (libjpeg-turbo 1.5.x)
+# 3: + ICC functions (libjpeg-turbo 2.0.x)
+#
+# libjpeg v8 API/ABI emulation:
+# 1: + Partial image decompression functions (libjpeg-turbo 1.5.x)
+# 2: + ICC functions (libjpeg-turbo 2.0.x)
 set(SO_AGE 2)
 if(WITH_MEM_SRCDST)
   set(SO_AGE 3)
@@ -322,9 +358,21 @@ message(STATUS "libjpeg API shared library version = ${SO_MAJOR_VERSION}.${SO_AG
 # names of functions whenever they are modified in a backward-incompatible
 # manner, it is always backward-ABI-compatible with itself, so the major and
 # minor SO versions don't change.  However, we increase the middle number (the
-# SO "age") whenever functions are added to the API.
+# SO "age") whenever functions are added to the API, because adding functions
+# affects forward API/ABI compatibility.
 set(TURBOJPEG_SO_MAJOR_VERSION 0)
-set(TURBOJPEG_SO_VERSION 0.2.0)
+# 0: TurboJPEG 1.3.x API
+# 1: TurboJPEG 1.4.x API
+#    The TurboJPEG 1.5.x API modified some of the function prototypes, adding
+#    the const keyword in front of pointers to unmodified buffers, but that did
+#    not affect forward API/ABI compatibility.
+# 2: TurboJPEG 2.0.x API
+#    The TurboJPEG 2.1.x API modified the behavior of the tjDecompressHeader3()
+#    function so that it accepts "abbreviated table specification" (AKA
+#    "tables-only") datastreams as well as JPEG images, but that did not affect
+#    forward API/ABI compatibility.
+set(TURBOJPEG_SO_AGE 2)
+set(TURBOJPEG_SO_VERSION 0.${TURBOJPEG_SO_AGE}.0)
 
 
 ###############################################################################
@@ -344,7 +392,7 @@ if(MSVC)
       endif()
     endforeach()
   endif()
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /W3 /wd4996")
+  add_definitions(-D_CRT_NONSTDC_NO_WARNINGS)
 endif()
 
 if(CMAKE_COMPILER_IS_GNUCC OR CMAKE_C_COMPILER_ID STREQUAL "Clang")
@@ -394,34 +442,6 @@ if(MSVC)
 endif()
 
 if(UNIX)
-  # Check for headers
-  check_include_files(locale.h HAVE_LOCALE_H)
-  check_include_files(stddef.h HAVE_STDDEF_H)
-  check_include_files(stdlib.h HAVE_STDLIB_H)
-  check_include_files(sys/types.h NEED_SYS_TYPES_H)
-
-  # Check for functions
-  include(CheckSymbolExists)
-  check_symbol_exists(memset string.h HAVE_MEMSET)
-  check_symbol_exists(memcpy string.h HAVE_MEMCPY)
-  if(NOT HAVE_MEMSET AND NOT HAVE_MEMCPY)
-    set(NEED_BSD_STRINGS 1)
-  endif()
-
-  # Check for types
-  check_type_size("unsigned char" UNSIGNED_CHAR)
-  check_type_size("unsigned short" UNSIGNED_SHORT)
-
-  # Check for compiler features
-  check_c_source_compiles("int main(void) { typedef struct undefined_structure *undef_struct_ptr;  undef_struct_ptr ptr = 0;  return ptr != 0; }"
-    INCOMPLETE_TYPES)
-  if(INCOMPLETE_TYPES)
-    message(STATUS "Compiler supports pointers to undefined structures.")
-  else()
-    set(INCOMPLETE_TYPES_BROKEN 1)
-    message(STATUS "Compiler does not support pointers to undefined structures.")
-  endif()
-
   if(CMAKE_CROSSCOMPILING)
     set(RIGHT_SHIFT_IS_UNSIGNED 0)
   else()
@@ -532,6 +552,7 @@ else()
   configure_file(jconfig.h.in jconfig.h)
 endif()
 configure_file(jconfigint.h.in jconfigint.h)
+configure_file(jversion.h.in jversion.h)
 if(UNIX)
   configure_file(libjpeg.map.in libjpeg.map)
 endif()
@@ -584,6 +605,9 @@ if(WITH_SIMD)
   endif()
 else()
   add_library(simd OBJECT jsimd_none.c)
+  if(NOT WIN32 AND (CMAKE_POSITION_INDEPENDENT_CODE OR ENABLE_SHARED))
+    set_target_properties(simd PROPERTIES POSITION_INDEPENDENT_CODE 1)
+  endif()
 endif()
 
 if(WITH_JAVA)
@@ -612,6 +636,12 @@ if(WITH_TURBOJPEG)
       set(TURBOJPEG_SOURCES ${TURBOJPEG_SOURCES} turbojpeg-jni.c)
       include_directories(${JAVA_INCLUDE_PATH} ${JAVA_INCLUDE_PATH2})
       set(TJMAPFILE ${CMAKE_CURRENT_SOURCE_DIR}/turbojpeg-mapfile.jni)
+    endif()
+    if(MSVC)
+      configure_file(${CMAKE_SOURCE_DIR}/win/turbojpeg.rc.in
+        ${CMAKE_BINARY_DIR}/win/turbojpeg.rc)
+      set(TURBOJPEG_SOURCES ${TURBOJPEG_SOURCES}
+        ${CMAKE_BINARY_DIR}/win/turbojpeg.rc)
     endif()
     add_library(turbojpeg SHARED ${TURBOJPEG_SOURCES})
     set_property(TARGET turbojpeg PROPERTY COMPILE_FLAGS
@@ -757,9 +787,11 @@ if(WITH_FUZZ)
   add_subdirectory(fuzz)
 endif()
 
+add_executable(strtest strtest.c)
+
 add_subdirectory(md5)
 
-if(MSVC_IDE OR XCODE)
+if(GENERATOR_IS_MULTI_CONFIG)
   set(OBJDIR "\${CTEST_CONFIGURATION_TYPE}/")
 else()
   set(OBJDIR "")
@@ -955,10 +987,8 @@ if(CPU_TYPE STREQUAL "x86_64" OR CPU_TYPE STREQUAL "i386")
     set(DEFAULT_FLOATTEST sse)
   elseif(CPU_TYPE STREQUAL "x86_64")
     set(DEFAULT_FLOATTEST no-fp-contract)
-  elseif(CPU_TYPE STREQUAL "i386" AND MSVC)
-    set(DEFAULT_FLOATTEST msvc)
   # else we can't really set an intelligent default for i386.  The appropriate
-  # value could be 387, no-fp-contract, or fp-contract, depending on the
+  # value could be no-fp-contract, fp-contract, 387, or msvc, depending on the
   # compiler and compiler options.  We leave it to the user to set FLOATTEST
   # manually.
   endif()
@@ -1216,7 +1246,7 @@ foreach(libtype ${TEST_LIBTYPES})
       testout_420_islow_ari.jpg ${TESTIMAGES}/testorig.ppm
       ${MD5_JPEG_420_ISLOW_ARI})
 
-    add_bittest(jpegtran 420-islow-ari "--revert;arithmetic"
+    add_bittest(jpegtran 420-islow-ari "-revert;-arithmetic"
       testout_420_islow_ari2.jpg ${TESTIMAGES}/testimgint.jpg
       ${MD5_JPEG_420_ISLOW_ARI})
 
@@ -1400,14 +1430,15 @@ if(WITH_TURBOJPEG)
       COMMAND ${BASH} ${CMAKE_CURRENT_BINARY_DIR}/tjbenchtest.java -yuv
       COMMAND echo tjbenchtest.java -progressive
       COMMAND ${BASH} ${CMAKE_CURRENT_BINARY_DIR}/tjbenchtest.java -progressive
-      COMMAND echo tjexampletest.java -progressive -yuv
+      COMMAND echo tjbenchtest.java -progressive -yuv
       COMMAND ${BASH} ${CMAKE_CURRENT_BINARY_DIR}/tjbenchtest.java
         -progressive -yuv
       COMMAND echo tjexampletest.java
       COMMAND ${BASH} ${CMAKE_CURRENT_BINARY_DIR}/tjexampletest.java
       DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/tjbenchtest
         ${CMAKE_CURRENT_BINARY_DIR}/tjbenchtest.java
-        ${CMAKE_CURRENT_BINARY_DIR}/tjexampletest)
+        ${CMAKE_CURRENT_BINARY_DIR}/tjexampletest
+        ${CMAKE_CURRENT_BINARY_DIR}/tjexampletest.java)
   else()
     add_custom_target(tjtest
       COMMAND echo tjbenchtest
@@ -1424,7 +1455,8 @@ if(WITH_TURBOJPEG)
       COMMAND ${BASH} ${CMAKE_CURRENT_BINARY_DIR}/tjbenchtest -progressive -yuv
       COMMAND echo tjexampletest
       COMMAND ${BASH} ${CMAKE_CURRENT_BINARY_DIR}/tjexampletest
-      DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/tjbenchtest)
+      DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/tjbenchtest
+        ${CMAKE_CURRENT_BINARY_DIR}/tjexampletest)
   endif()
 endif()
 
@@ -1455,7 +1487,7 @@ if(WITH_TURBOJPEG)
       INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
       ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
     if(NOT ENABLE_SHARED)
-      if(MSVC_IDE OR XCODE)
+      if(GENERATOR_IS_MULTI_CONFIG)
         set(DIR "${CMAKE_CURRENT_BINARY_DIR}/\${CMAKE_INSTALL_CONFIG_NAME}")
       else()
         set(DIR ${CMAKE_CURRENT_BINARY_DIR})
@@ -1473,7 +1505,7 @@ if(ENABLE_STATIC)
     INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
   if(NOT ENABLE_SHARED)
-    if(MSVC_IDE OR XCODE)
+    if(GENERATOR_IS_MULTI_CONFIG)
       set(DIR "${CMAKE_CURRENT_BINARY_DIR}/\${CMAKE_INSTALL_CONFIG_NAME}")
     else()
       set(DIR ${CMAKE_CURRENT_BINARY_DIR})
@@ -1509,8 +1541,11 @@ if(UNIX OR MINGW)
     DESTINATION ${CMAKE_INSTALL_MANDIR}/man1)
 endif()
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/pkgscripts/libjpeg.pc
-  ${CMAKE_CURRENT_BINARY_DIR}/pkgscripts/libturbojpeg.pc
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+if(WITH_TURBOJPEG)
+  install(FILES ${CMAKE_CURRENT_BINARY_DIR}/pkgscripts/libturbojpeg.pc
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+endif()
 install(FILES
   ${CMAKE_CURRENT_BINARY_DIR}/pkgscripts/${CMAKE_PROJECT_NAME}Config.cmake
   ${CMAKE_CURRENT_BINARY_DIR}/pkgscripts/${CMAKE_PROJECT_NAME}ConfigVersion.cmake
